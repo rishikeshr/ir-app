@@ -21,6 +21,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
@@ -41,10 +42,11 @@ public class MainActivity extends Activity {
     private static final int BACKTRACK_CODES = 20;
     private static final int AUTO_STEP_MS = 1500;
     private static final int TOTAL_CODES = Nec.ADDRESSES * Nec.COMMANDS;
-    private static final String[] PRESETS = {
-        "Fan on/off", "Light", "Speed 1", "Speed 2", "Speed 3", "Speed 4", "Speed 5",
-        "Speed +", "Speed -", "Boost", "Timer", "Sleep", "Custom name..."
-    };
+    /** The six buttons on the Luminous remote, in the order they are offered when saving. */
+    private static final String POWER = "Power";
+    private static final String[] SLOTS = {POWER, "Speed 1", "Speed 2", "Speed 3", "Speed 4", "Speed 5"};
+    /** Where each speed key sits on the ring, in degrees anticlockwise from the right. */
+    private static final int[] RING_ANGLES = {234, 162, 90, 18, 306};
 
     private static final int BG = 0xFF0E1320;
     private static final int CARD = 0xFF1A2133;
@@ -75,6 +77,7 @@ public class MainActivity extends Activity {
     private int pinStart = -1;
     private boolean pinFresh = true;
     private boolean autoStep;
+    private String activeSpeed;
 
     private LinearLayout scanPanel;
     private LinearLayout pinPanel;
@@ -104,6 +107,7 @@ public class MainActivity extends Activity {
         scanPos = clampPos(prefs.getInt("scanPos", 0));
         pinPos = clampPos(prefs.getInt("pinPos", 0));
         loadSaved();
+        activeSpeed = prefs.getString("activeSpeed", null);
 
         worker = new HandlerThread("ir-sender");
         worker.start();
@@ -309,13 +313,18 @@ public class MainActivity extends Activity {
 
     private void askLabel() {
         setAutoStep(false);
+        final String[] items = new String[SLOTS.length + 1];
+        for (int i = 0; i < SLOTS.length; i++) {
+            items[i] = find(SLOTS[i]) == null ? SLOTS[i] : SLOTS[i] + "  (replace)";
+        }
+        items[SLOTS.length] = "Something else...";
         new AlertDialog.Builder(this)
-            .setTitle("What did the fan do?")
-            .setItems(PRESETS, (dialog, which) -> {
-                if (which == PRESETS.length - 1) {
+            .setTitle("Which button does the same thing?")
+            .setItems(items, (dialog, which) -> {
+                if (which == SLOTS.length) {
                     askName("Name this button", "", name -> saveCode(name));
                 } else {
-                    saveCode(PRESETS[which]);
+                    saveCode(SLOTS[which]);
                 }
             })
             .setNegativeButton("Cancel", null)
@@ -343,35 +352,89 @@ public class MainActivity extends Activity {
 
     private void saveCode(String label) {
         final boolean first = saved.isEmpty();
-        saved.add(new String[] {label, String.valueOf(pinPos)});
+        String[] existing = isSlot(label) ? find(label) : null;
+        if (existing != null) {
+            existing[1] = String.valueOf(pinPos);
+        } else {
+            saved.add(new String[] {label, String.valueOf(pinPos)});
+        }
         storeSaved();
         refreshRemote();
-        new AlertDialog.Builder(this)
+        int missing = missingSlots();
+        String message;
+        if (missing == 0) {
+            message = "All six buttons are set up. The remote is ready.";
+        } else if (first) {
+            message = "The other buttons are in the same group of 256 codes. "
+                + "Keep looking starts again from the beginning of that group.";
+        } else {
+            message = missing + " of 6 buttons still to find. Keep looking carries on from this code.";
+        }
+        AlertDialog.Builder dialog = new AlertDialog.Builder(this)
             .setTitle("Saved \"" + label + "\"")
-            .setMessage(first
-                ? "The fan's other buttons are in the same group of 256 codes. "
-                    + "Keep looking starts again from the beginning of that group."
-                : "Keep looking carries on from this code.")
-            .setPositiveButton("Keep looking", (dialog, which) -> {
+            .setMessage(message)
+            .setNegativeButton("Open remote", (d, which) -> show(SCREEN_REMOTE));
+        if (missing > 0) {
+            dialog.setPositiveButton("Keep looking", (d, which) -> {
                 if (first) {
-                    pinPos = pinPos / Nec.COMMANDS * Nec.COMMANDS;
-                    pinStart = -1;
-                    pinFresh = true;
-                    refreshPin();
+                    startOfGroup(pinPos);
                 }
-            })
-            .setNegativeButton("Open remote", (dialog, which) -> show(SCREEN_REMOTE))
-            .show();
+            });
+        }
+        dialog.show();
+    }
+
+    private static boolean isSlot(String label) {
+        for (String slot : SLOTS) {
+            if (slot.equals(label)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String[] find(String label) {
+        for (String[] entry : saved) {
+            if (entry[0].equals(label)) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    private int missingSlots() {
+        int missing = 0;
+        for (String slot : SLOTS) {
+            if (find(slot) == null) {
+                missing++;
+            }
+        }
+        return missing;
+    }
+
+    /** Points Pinpoint at the first code of the group that contains pos, without sending. */
+    private void startOfGroup(int pos) {
+        pinPos = pos / Nec.COMMANDS * Nec.COMMANDS;
+        pinStart = -1;
+        pinFresh = true;
+        refreshPin();
+    }
+
+    /** Opens the quickest way to find a missing button: the known group if there is one, else a scan. */
+    private void findMore() {
+        if (saved.isEmpty()) {
+            show(SCREEN_SCAN);
+        } else {
+            startOfGroup(Integer.parseInt(saved.get(0)[1]));
+            show(SCREEN_PIN);
+        }
     }
 
     /** Moves to the first code of the neighbouring group without sending anything. */
     private void jumpGroup(int delta) {
         setAutoStep(false);
         int group = Math.max(0, Math.min(Nec.ADDRESSES - 1, pinPos / Nec.COMMANDS + delta));
-        pinPos = group * Nec.COMMANDS;
-        pinStart = -1;
-        pinFresh = true;
-        refreshPin();
+        startOfGroup(group * Nec.COMMANDS);
     }
 
     // ---------- saved remote ----------
@@ -387,6 +450,9 @@ public class MainActivity extends Activity {
             try {
                 int pos = Integer.parseInt(parts[1]);
                 if (pos >= 0 && pos < TOTAL_CODES) {
+                    if ("Fan on/off".equals(parts[0]) && find(POWER) == null) {
+                        parts[0] = POWER;
+                    }
                     saved.add(parts);
                 }
             } catch (NumberFormatException ignored) {
@@ -405,28 +471,57 @@ public class MainActivity extends Activity {
 
     private void refreshRemote() {
         remoteGrid.removeAllViews();
-        if (saved.isEmpty()) {
-            LinearLayout empty = card();
-            empty.addView(label("No buttons yet", 20, TEXT, true));
-            empty.addView(gap(6));
-            empty.addView(label("Scan for your fan's codes first. Each code you save shows up here as a button.",
-                15, MUTED, false));
-            empty.addView(gap(16));
-            empty.addView(pill("Find codes", ACCENT, ON_ACCENT, 56, 17, () -> show(SCREEN_SCAN)));
-            remoteGrid.addView(empty);
-            return;
+        int missing = missingSlots();
+
+        LinearLayout body = card();
+        body.setBackground(rounded(CARD, 40));
+        body.setGravity(Gravity.CENTER_HORIZONTAL);
+        TextView power = remoteKey(POWER, "Power", 20, 28);
+        body.addView(power, new LinearLayout.LayoutParams(dp(148), dp(64)));
+        body.addView(gap(20));
+
+        int ringSize = dp(264);
+        int keySize = dp(76);
+        FrameLayout ring = new FrameLayout(this);
+        View hub = new View(this);
+        hub.setBackground(outline(CARD_HIGH, 30, false));
+        FrameLayout.LayoutParams hubLp = new FrameLayout.LayoutParams(dp(60), dp(60));
+        hubLp.gravity = Gravity.CENTER;
+        ring.addView(hub, hubLp);
+        for (int i = 0; i < RING_ANGLES.length; i++) {
+            double angle = Math.toRadians(RING_ANGLES[i]);
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(keySize, keySize);
+            lp.leftMargin = (int) Math.round(ringSize / 2.0 + dp(92) * Math.cos(angle) - keySize / 2.0);
+            lp.topMargin = (int) Math.round(ringSize / 2.0 - dp(92) * Math.sin(angle) - keySize / 2.0);
+            ring.addView(remoteKey(SLOTS[i + 1], String.valueOf(i + 1), 28, 38), lp);
         }
+        body.addView(ring, new LinearLayout.LayoutParams(ringSize, ringSize));
+        body.addView(gap(8));
+        body.addView(centered(label(missing == 0
+            ? "Point the top edge of the phone at the fan."
+            : "Dashed buttons are not set up yet.", 13, MUTED, false)));
+        remoteGrid.addView(body);
+        remoteGrid.addView(gap(16));
+
+        if (missing > 0) {
+            remoteGrid.addView(pill(missing == SLOTS.length ? "Set up the remote" : "Find the other " + missing
+                + (missing == 1 ? " button" : " buttons"), ACCENT, ON_ACCENT, 56, 17, () -> findMore()));
+            remoteGrid.addView(gap(12));
+        }
+
         LinearLayout row = null;
-        for (int i = 0; i < saved.size(); i++) {
-            final String[] entry = saved.get(i);
-            final int pos = Integer.parseInt(entry[1]);
-            if (i % 2 == 0) {
+        int extras = 0;
+        for (final String[] entry : saved) {
+            if (isSlot(entry[0])) {
+                continue;
+            }
+            if (extras % 2 == 0) {
                 row = new LinearLayout(this);
                 row.setOrientation(LinearLayout.HORIZONTAL);
                 remoteGrid.addView(row, matchWidth(0));
             }
-            boolean main = i == 0;
-            TextView key = pill(entry[0], main ? ACCENT : CARD_HIGH, main ? ON_ACCENT : TEXT, 96, 18, null);
+            final int pos = Integer.parseInt(entry[1]);
+            TextView key = pill(entry[0], CARD_HIGH, TEXT, 72, 17, null);
             key.setOnClickListener(v -> {
                 v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
                 sendAsync(pos);
@@ -435,28 +530,75 @@ public class MainActivity extends Activity {
                 editEntry(entry);
                 return true;
             });
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(96), 1f);
-            lp.setMargins(dp(5), dp(5), dp(5), dp(5));
-            row.addView(key, lp);
+            row.addView(key, weighted(72, 5, 5));
+            extras++;
         }
-        if (saved.size() % 2 == 1) {
-            View filler = new View(this);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(96), 1f);
-            lp.setMargins(dp(5), dp(5), dp(5), dp(5));
-            row.addView(filler, lp);
+        if (extras % 2 == 1) {
+            row.addView(new View(this), weighted(72, 5, 5));
         }
-        remoteGrid.addView(gap(12));
-        remoteGrid.addView(link("Add another button", () -> show(SCREEN_PIN)));
-        remoteGrid.addView(label("Press and hold a button to rename or delete it.", 13, MUTED, false));
+        if (!saved.isEmpty()) {
+            remoteGrid.addView(gap(8));
+            remoteGrid.addView(centered(label("Press and hold a button to change it.", 13, MUTED, false)));
+        }
+    }
+
+    /** One key of the on-screen remote: sends its code when set up, offers to find it when not. */
+    private TextView remoteKey(final String slot, String caption, int sp, int radiusDp) {
+        final String[] entry = find(slot);
+        final boolean isPower = POWER.equals(slot);
+        boolean active = entry != null && slot.equals(activeSpeed);
+        int fill = isPower ? AMBER : (active ? ACCENT : CARD_HIGH);
+        int textColor = entry == null ? MUTED : (isPower ? ON_AMBER : (active ? ON_ACCENT : TEXT));
+
+        TextView key = new TextView(this);
+        key.setText(caption);
+        key.setTextSize(sp);
+        key.setTextColor(textColor);
+        key.setTypeface(Typeface.DEFAULT_BOLD);
+        key.setGravity(Gravity.CENTER);
+        Drawable shape = entry == null ? outline(MUTED, radiusDp, true) : rounded(fill, radiusDp);
+        key.setBackground(new RippleDrawable(ColorStateList.valueOf(0x40FFFFFF), shape, rounded(0xFFFFFFFF, radiusDp)));
+        key.setClickable(true);
+        key.setFocusable(true);
+        key.setContentDescription(slot);
+        if (entry == null) {
+            key.setOnClickListener(v -> new AlertDialog.Builder(this)
+                .setTitle(slot + " is not set up")
+                .setMessage("Find its code by sending codes one at a time while you watch the fan.")
+                .setPositiveButton("Find it", (d, which) -> findMore())
+                .setNegativeButton("Cancel", null)
+                .show());
+            return key;
+        }
+        final int pos = Integer.parseInt(entry[1]);
+        key.setOnClickListener(v -> {
+            v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+            sendAsync(pos);
+            activeSpeed = isPower ? null : slot;
+            prefs.edit().putString("activeSpeed", activeSpeed).apply();
+            refreshRemote();
+        });
+        key.setOnLongClickListener(v -> {
+            editEntry(entry);
+            return true;
+        });
+        return key;
     }
 
     private void editEntry(final String[] entry) {
+        final boolean slot = isSlot(entry[0]);
+        String[] items = slot
+            ? new String[] {"Find a different code", "Clear this button"}
+            : new String[] {"Rename", "Delete"};
         new AlertDialog.Builder(this)
             .setTitle(entry[0])
-            .setItems(new String[] {"Rename", "Delete"}, (dialog, which) -> {
-                if (which == 0) {
+            .setItems(items, (dialog, which) -> {
+                if (which == 0 && slot) {
+                    startOfGroup(Integer.parseInt(entry[1]));
+                    show(SCREEN_PIN);
+                } else if (which == 0) {
                     askName("Rename button", entry[0], name -> {
-                        entry[0] = name;
+                        entry[0] = isSlot(name) ? name + " (2)" : name;
                         storeSaved();
                         refreshRemote();
                     });
@@ -617,7 +759,7 @@ public class MainActivity extends Activity {
     private void buildRemotePanel() {
         remotePanel = column();
         remotePanel.addView(label("Fan remote", 28, TEXT, true));
-        remotePanel.addView(label("Point the top edge of the phone at the fan.", 15, MUTED, false));
+        remotePanel.addView(label("The same buttons as your Luminous remote.", 15, MUTED, false));
         remotePanel.addView(gap(16));
         remoteGrid = column();
         remotePanel.addView(remoteGrid);
@@ -746,6 +888,23 @@ public class MainActivity extends Activity {
         d.setColor(color);
         d.setCornerRadius(dp(radiusDp));
         return d;
+    }
+
+    private Drawable outline(int color, int radiusDp, boolean dashed) {
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(0x00000000);
+        d.setCornerRadius(dp(radiusDp));
+        if (dashed) {
+            d.setStroke(dp(2), color, dp(6), dp(4));
+        } else {
+            d.setStroke(dp(2), color);
+        }
+        return d;
+    }
+
+    private TextView centered(TextView t) {
+        t.setGravity(Gravity.CENTER);
+        return t;
     }
 
     private View gap(int heightDp) {
