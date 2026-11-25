@@ -6,7 +6,8 @@
 
     <application
         android:label="Fan IR Scanner"
-        android:theme="@android:style/Theme.DeviceDefault.DayNight">
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
         <activity
             android:name=".MainActivity"
             android:exported="true"

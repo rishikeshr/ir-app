@@ -7,11 +7,13 @@ using the phone's built-in IR blaster.
 - **Pinpoint** steps one code at a time around the spot where the fan reacted.
 - **Remote** keeps the codes you saved as buttons.
 
-## Build
+## Install
 
-- **GitHub:** push this folder to a repository. The included workflow builds the APK;
-  download `fan-ir-scanner-apk` from the run's Artifacts.
-- **Android Studio:** open the folder and press Run with the phone connected.
+Download the latest build on the phone and open it:
+https://github.com/rishikeshr/ir-app/releases/latest/download/fan-ir-scanner.apk
+
+Every push to `main` rebuilds the APK and replaces that release. Builds are signed with the
+debug key in `app/debug.keystore`, so a new build installs over the old one and keeps saved buttons.
 
 ## Limits
 

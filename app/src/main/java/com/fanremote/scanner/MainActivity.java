@@ -4,15 +4,22 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.content.res.ColorStateList;
+import android.graphics.Typeface;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.hardware.ConsumerIrManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.view.Gravity;
+import android.view.HapticFeedbackConstants;
 import android.view.View;
+import android.view.ViewGroup;
 import android.view.WindowManager;
-import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
@@ -26,8 +33,8 @@ import java.util.Locale;
 
 /**
  * Finds the infrared codes of a fan whose remote is lost.
- * Scan: sweeps every standard NEC code. Pinpoint: steps one code at a time
- * around the spot where the fan reacted. Remote: the codes saved as buttons.
+ * Scan sweeps every standard NEC code. Pinpoint steps one code at a time
+ * around the spot where the fan reacted. Remote shows the saved codes as buttons.
  */
 public class MainActivity extends Activity {
     private static final int CODE_PERIOD_MS = 110;
@@ -38,6 +45,20 @@ public class MainActivity extends Activity {
         "Fan on/off", "Light", "Speed 1", "Speed 2", "Speed 3", "Speed 4", "Speed 5",
         "Speed +", "Speed -", "Boost", "Timer", "Sleep", "Custom name..."
     };
+
+    private static final int BG = 0xFF0E1320;
+    private static final int CARD = 0xFF1A2133;
+    private static final int CARD_HIGH = 0xFF26304A;
+    private static final int TEXT = 0xFFF2F5FA;
+    private static final int MUTED = 0xFF9AA5BD;
+    private static final int ACCENT = 0xFF5EEAD4;
+    private static final int ON_ACCENT = 0xFF06231F;
+    private static final int AMBER = 0xFFFFC857;
+    private static final int ON_AMBER = 0xFF2B1D00;
+
+    private static final int SCREEN_SCAN = 0;
+    private static final int SCREEN_PIN = 1;
+    private static final int SCREEN_REMOTE = 2;
 
     private final int[] order = Nec.addressOrder();
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -51,21 +72,33 @@ public class MainActivity extends Activity {
     private volatile boolean scanning;
     private volatile int scanPos;
     private int pinPos;
+    private int pinStart = -1;
+    private boolean pinFresh = true;
     private boolean autoStep;
 
     private LinearLayout scanPanel;
     private LinearLayout pinPanel;
     private LinearLayout remotePanel;
-    private LinearLayout remoteButtons;
-    private TextView scanStatus;
-    private TextView pinStatus;
+    private LinearLayout remoteGrid;
+    private TextView navFind;
+    private TextView navRemote;
+    private TextView scanPercent;
+    private TextView scanLine;
+    private TextView scanCode;
+    private TextView scanToggle;
+    private TextView reactedButton;
     private ProgressBar scanProgress;
-    private Button scanToggle;
-    private Button autoToggle;
+    private TextView pinStep;
+    private TextView pinCode;
+    private TextView pinNext;
+    private TextView autoToggle;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        getWindow().setStatusBarColor(BG);
+        getWindow().setNavigationBarColor(BG);
+
         ir = (ConsumerIrManager) getSystemService(Context.CONSUMER_IR_SERVICE);
         prefs = getSharedPreferences("fan", MODE_PRIVATE);
         scanPos = clampPos(prefs.getInt("scanPos", 0));
@@ -77,12 +110,12 @@ public class MainActivity extends Activity {
         bg = new Handler(worker.getLooper());
 
         buildUi();
-        showPanel(saved.isEmpty() ? scanPanel : remotePanel);
         refreshScan();
         refreshPin();
         refreshRemote();
+        show(saved.isEmpty() ? SCREEN_SCAN : SCREEN_REMOTE);
 
-        if (ir == null || !ir.hasIrEmitter()) {
+        if (!hasEmitter()) {
             new AlertDialog.Builder(this)
                 .setTitle("No IR blaster found")
                 .setMessage("This phone does not report an infrared emitter, so the app cannot send codes.")
@@ -94,7 +127,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
-        stopScan();
+        scanning = false;
         setAutoStep(false);
         prefs.edit().putInt("scanPos", scanPos).putInt("pinPos", pinPos).apply();
     }
@@ -106,6 +139,10 @@ public class MainActivity extends Activity {
         worker.quitSafely();
     }
 
+    private boolean hasEmitter() {
+        return ir != null && ir.hasIrEmitter();
+    }
+
     // ---------- sending ----------
 
     /** Sends one code and waits out the rest of the period so codes never overlap. */
@@ -115,12 +152,7 @@ public class MainActivity extends Activity {
             ir.transmit(Nec.CARRIER_HZ, Nec.frame(address, command));
         } catch (final RuntimeException e) {
             scanning = false;
-            ui.post(new Runnable() {
-                @Override
-                public void run() {
-                    toast("Could not send: " + e.getMessage());
-                }
-            });
+            ui.post(() -> toast("Could not send: " + e.getMessage()));
         }
         long spent = SystemClock.elapsedRealtime() - start;
         if (spent < CODE_PERIOD_MS) {
@@ -129,22 +161,17 @@ public class MainActivity extends Activity {
     }
 
     private void sendAsync(final int pos) {
-        if (ir == null) {
+        if (!hasEmitter()) {
             return;
         }
-        bg.post(new Runnable() {
-            @Override
-            public void run() {
-                send(order[pos / Nec.COMMANDS], pos % Nec.COMMANDS);
-            }
-        });
+        bg.post(() -> send(order[pos / Nec.COMMANDS], pos % Nec.COMMANDS));
     }
 
     private static int clampPos(int pos) {
         return Math.max(0, Math.min(TOTAL_CODES - 1, pos));
     }
 
-    private String describe(int pos) {
+    private String hex(int pos) {
         return String.format(Locale.US, "Address 0x%02X, command 0x%02X",
             order[pos / Nec.COMMANDS], pos % Nec.COMMANDS);
     }
@@ -165,28 +192,16 @@ public class MainActivity extends Activity {
                     scanPos = pos + 1;
                 }
                 if (pos % 4 == 0) {
-                    ui.post(refreshScanTask);
+                    ui.post(() -> refreshScan());
                 }
             }
             final boolean done = finished;
-            ui.post(new Runnable() {
-                @Override
-                public void run() {
-                    onScanStopped(done);
-                }
-            });
-        }
-    };
-
-    private final Runnable refreshScanTask = new Runnable() {
-        @Override
-        public void run() {
-            refreshScan();
+            ui.post(() -> onScanStopped(done));
         }
     };
 
     private void startScan() {
-        if (scanning || ir == null || !ir.hasIrEmitter()) {
+        if (scanning || !hasEmitter()) {
             return;
         }
         scanning = true;
@@ -195,30 +210,27 @@ public class MainActivity extends Activity {
         refreshScan();
     }
 
-    private void stopScan() {
-        scanning = false;
-    }
-
     private void onScanStopped(boolean finished) {
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         prefs.edit().putInt("scanPos", scanPos).apply();
         refreshScan();
         if (finished) {
             new AlertDialog.Builder(this)
-                .setTitle("Sweep finished")
-                .setMessage("Every standard NEC code was sent. If the fan never reacted, it uses "
-                    + "radio (RF) or a different infrared format, and this phone cannot control it.")
+                .setTitle("Scan finished")
+                .setMessage("Every standard code was sent. If the fan never reacted, it uses radio (RF) "
+                    + "or a different infrared format, and this phone cannot control it.")
                 .setPositiveButton("OK", null)
                 .show();
         }
     }
 
     private void onReacted() {
-        stopScan();
-        pinPos = clampPos(scanPos - BACKTRACK_CODES);
-        showPanel(pinPanel);
+        scanning = false;
+        pinStart = clampPos(scanPos - BACKTRACK_CODES);
+        pinPos = pinStart;
+        pinFresh = true;
         refreshPin();
-        toast("Stepping back " + BACKTRACK_CODES + " codes. Use Next to find the exact one.");
+        show(SCREEN_PIN);
     }
 
     private void refreshScan() {
@@ -226,13 +238,14 @@ public class MainActivity extends Activity {
         int remainingSec = (TOTAL_CODES - pos) * CODE_PERIOD_MS / 1000;
         String left = remainingSec >= 3600
             ? (remainingSec / 3600) + " h " + (remainingSec % 3600 / 60) + " min"
-            : (remainingSec / 60) + " min";
-        scanStatus.setText((scanning ? "Scanning\n" : "Paused\n")
-            + "Address " + (pos / Nec.COMMANDS + 1) + " of " + Nec.ADDRESSES + "\n"
-            + describe(pos) + "\n"
-            + "At most " + left + " left");
+            : Math.max(1, remainingSec / 60) + " min";
+        scanPercent.setText(String.format(Locale.US, "%.1f%%", pos * 100f / TOTAL_CODES));
+        scanLine.setText((scanning ? "Scanning" : (pos == 0 ? "Ready" : "Paused"))
+            + "  ·  at most " + left + " left");
+        scanCode.setText(hex(pos));
         scanProgress.setProgress(pos);
-        scanToggle.setText(scanning ? "Pause" : (pos == 0 ? "Start scan" : "Resume scan"));
+        scanToggle.setText(scanning ? "Pause" : (pos == 0 ? "Start scanning" : "Resume scanning"));
+        setEnabled(reactedButton, pos > 0);
     }
 
     // ---------- pinpoint ----------
@@ -247,12 +260,23 @@ public class MainActivity extends Activity {
                 setAutoStep(false);
                 return;
             }
-            stepPin(1);
+            nextPin();
             ui.postDelayed(this, AUTO_STEP_MS);
         }
     };
 
+    /** Sends the current code the first time, then advances one code per tap. */
+    private void nextPin() {
+        if (pinFresh) {
+            pinFresh = false;
+            stepPin(0);
+        } else {
+            stepPin(1);
+        }
+    }
+
     private void stepPin(int delta) {
+        pinFresh = false;
         pinPos = clampPos(pinPos + delta);
         sendAsync(pinPos);
         refreshPin();
@@ -262,57 +286,92 @@ public class MainActivity extends Activity {
         autoStep = on;
         ui.removeCallbacks(autoStepTask);
         if (on) {
-            ui.postDelayed(autoStepTask, AUTO_STEP_MS);
+            ui.post(autoStepTask);
         }
         if (autoToggle != null) {
-            autoToggle.setText(on ? "Stop auto-step" : "Auto-step forward (one every 1.5 s)");
+            autoToggle.setText(on ? "Stop stepping" : "Step automatically, one every 1.5 s");
         }
     }
 
     private void refreshPin() {
-        pinStatus.setText(describe(pinPos));
+        int n = pinPos - pinStart + 1;
+        boolean inWindow = pinStart >= 0 && n >= 1 && n <= BACKTRACK_CODES;
+        if (pinFresh) {
+            pinStep.setText("Ready");
+        } else if (inWindow) {
+            pinStep.setText("Code " + n + " of about " + BACKTRACK_CODES);
+        } else {
+            pinStep.setText("Code " + (pinPos % Nec.COMMANDS + 1) + " of " + Nec.COMMANDS + " in this group");
+        }
+        pinCode.setText(hex(pinPos));
+        pinNext.setText(pinFresh ? "Send the first code" : "Next code");
     }
 
     private void askLabel() {
         setAutoStep(false);
         new AlertDialog.Builder(this)
-            .setTitle("What did this code do?")
-            .setItems(PRESETS, new android.content.DialogInterface.OnClickListener() {
-                @Override
-                public void onClick(android.content.DialogInterface dialog, int which) {
-                    if (which == PRESETS.length - 1) {
-                        askCustomLabel();
-                    } else {
-                        saveCode(PRESETS[which]);
-                    }
+            .setTitle("What did the fan do?")
+            .setItems(PRESETS, (dialog, which) -> {
+                if (which == PRESETS.length - 1) {
+                    askName("Name this button", "", name -> saveCode(name));
+                } else {
+                    saveCode(PRESETS[which]);
                 }
             })
             .setNegativeButton("Cancel", null)
             .show();
     }
 
-    private void askCustomLabel() {
+    private interface NameCallback {
+        void onName(String name);
+    }
+
+    private void askName(String title, String current, final NameCallback callback) {
         final EditText input = new EditText(this);
         input.setHint("Button name");
+        input.setText(current);
         new AlertDialog.Builder(this)
-            .setTitle("Name this button")
+            .setTitle(title)
             .setView(input)
-            .setPositiveButton("Save", new android.content.DialogInterface.OnClickListener() {
-                @Override
-                public void onClick(android.content.DialogInterface dialog, int which) {
-                    String name = input.getText().toString().replace('\t', ' ').replace('\n', ' ').trim();
-                    saveCode(name.isEmpty() ? "Button" : name);
-                }
+            .setPositiveButton("Save", (dialog, which) -> {
+                String name = input.getText().toString().replace('\t', ' ').replace('\n', ' ').trim();
+                callback.onName(name.isEmpty() ? "Button" : name);
             })
             .setNegativeButton("Cancel", null)
             .show();
     }
 
     private void saveCode(String label) {
+        final boolean first = saved.isEmpty();
         saved.add(new String[] {label, String.valueOf(pinPos)});
         storeSaved();
         refreshRemote();
-        toast("Saved \"" + label + "\". It is now on the Remote tab.");
+        new AlertDialog.Builder(this)
+            .setTitle("Saved \"" + label + "\"")
+            .setMessage(first
+                ? "The fan's other buttons are in the same group of 256 codes. "
+                    + "Keep looking starts again from the beginning of that group."
+                : "Keep looking carries on from this code.")
+            .setPositiveButton("Keep looking", (dialog, which) -> {
+                if (first) {
+                    pinPos = pinPos / Nec.COMMANDS * Nec.COMMANDS;
+                    pinStart = -1;
+                    pinFresh = true;
+                    refreshPin();
+                }
+            })
+            .setNegativeButton("Open remote", (dialog, which) -> show(SCREEN_REMOTE))
+            .show();
+    }
+
+    /** Moves to the first code of the neighbouring group without sending anything. */
+    private void jumpGroup(int delta) {
+        setAutoStep(false);
+        int group = Math.max(0, Math.min(Nec.ADDRESSES - 1, pinPos / Nec.COMMANDS + delta));
+        pinPos = group * Nec.COMMANDS;
+        pinStart = -1;
+        pinFresh = true;
+        refreshPin();
     }
 
     // ---------- saved remote ----------
@@ -345,37 +404,63 @@ public class MainActivity extends Activity {
     }
 
     private void refreshRemote() {
-        remoteButtons.removeAllViews();
+        remoteGrid.removeAllViews();
         if (saved.isEmpty()) {
-            remoteButtons.addView(text("No buttons yet. Find a code on the Scan tab, then save it from Pinpoint."));
+            LinearLayout empty = card();
+            empty.addView(label("No buttons yet", 20, TEXT, true));
+            empty.addView(gap(6));
+            empty.addView(label("Scan for your fan's codes first. Each code you save shows up here as a button.",
+                15, MUTED, false));
+            empty.addView(gap(16));
+            empty.addView(pill("Find codes", ACCENT, ON_ACCENT, 56, 17, () -> show(SCREEN_SCAN)));
+            remoteGrid.addView(empty);
             return;
         }
-        for (final String[] entry : saved) {
+        LinearLayout row = null;
+        for (int i = 0; i < saved.size(); i++) {
+            final String[] entry = saved.get(i);
             final int pos = Integer.parseInt(entry[1]);
-            Button b = button(entry[0], new View.OnClickListener() {
-                @Override
-                public void onClick(View v) {
-                    sendAsync(pos);
-                }
+            if (i % 2 == 0) {
+                row = new LinearLayout(this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                remoteGrid.addView(row, matchWidth(0));
+            }
+            boolean main = i == 0;
+            TextView key = pill(entry[0], main ? ACCENT : CARD_HIGH, main ? ON_ACCENT : TEXT, 96, 18, null);
+            key.setOnClickListener(v -> {
+                v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+                sendAsync(pos);
             });
-            b.setOnLongClickListener(new View.OnLongClickListener() {
-                @Override
-                public boolean onLongClick(View v) {
-                    confirmDelete(entry);
-                    return true;
-                }
+            key.setOnLongClickListener(v -> {
+                editEntry(entry);
+                return true;
             });
-            remoteButtons.addView(b);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(96), 1f);
+            lp.setMargins(dp(5), dp(5), dp(5), dp(5));
+            row.addView(key, lp);
         }
-        remoteButtons.addView(text("Press and hold a button to delete it."));
+        if (saved.size() % 2 == 1) {
+            View filler = new View(this);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(96), 1f);
+            lp.setMargins(dp(5), dp(5), dp(5), dp(5));
+            row.addView(filler, lp);
+        }
+        remoteGrid.addView(gap(12));
+        remoteGrid.addView(link("Add another button", () -> show(SCREEN_PIN)));
+        remoteGrid.addView(label("Press and hold a button to rename or delete it.", 13, MUTED, false));
     }
 
-    private void confirmDelete(final String[] entry) {
+    private void editEntry(final String[] entry) {
         new AlertDialog.Builder(this)
-            .setTitle("Delete \"" + entry[0] + "\"?")
-            .setPositiveButton("Delete", new android.content.DialogInterface.OnClickListener() {
-                @Override
-                public void onClick(android.content.DialogInterface dialog, int which) {
+            .setTitle(entry[0])
+            .setItems(new String[] {"Rename", "Delete"}, (dialog, which) -> {
+                if (which == 0) {
+                    askName("Rename button", entry[0], name -> {
+                        entry[0] = name;
+                        storeSaved();
+                        refreshRemote();
+                    });
+                } else {
                     saved.remove(entry);
                     storeSaved();
                     refreshRemote();
@@ -389,164 +474,170 @@ public class MainActivity extends Activity {
 
     private void buildUi() {
         LinearLayout root = column();
+        root.setBackgroundColor(BG);
         root.setFitsSystemWindows(true);
-        int pad = dp(16);
-        root.setPadding(pad, pad, pad, pad);
 
-        LinearLayout tabs = new LinearLayout(this);
-        tabs.setOrientation(LinearLayout.HORIZONTAL);
-        tabs.addView(tab("Scan", new Runnable() {
-            @Override
-            public void run() {
-                showPanel(scanPanel);
-            }
-        }));
-        tabs.addView(tab("Pinpoint", new Runnable() {
-            @Override
-            public void run() {
-                stopScan();
-                showPanel(pinPanel);
-            }
-        }));
-        tabs.addView(tab("Remote", new Runnable() {
-            @Override
-            public void run() {
-                stopScan();
-                showPanel(remotePanel);
-            }
-        }));
-        root.addView(tabs);
-
-        scanPanel = column();
-        scanPanel.addView(text("Switch the fan on at the wall, point the top edge of the phone at it and "
-            + "start. Watch the fan and its light, and listen for a beep. The moment anything "
-            + "changes, tap \"It reacted\"."));
-        scanStatus = text("");
-        scanStatus.setTextSize(18);
-        scanPanel.addView(scanStatus);
-        scanProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        scanProgress.setMax(TOTAL_CODES);
-        scanPanel.addView(scanProgress);
-        scanToggle = button("Start scan", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                if (scanning) {
-                    stopScan();
-                } else {
-                    startScan();
-                }
-            }
-        });
-        scanPanel.addView(scanToggle);
-        Button reacted = button("It reacted", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                onReacted();
-            }
-        });
-        reacted.setMinHeight(dp(96));
-        reacted.setTextSize(22);
-        scanPanel.addView(reacted);
-        scanPanel.addView(button("Start over from the first code", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                stopScan();
-                scanPos = 0;
-                refreshScan();
-            }
-        }));
-
-        pinPanel = column();
-        pinPanel.addView(text("Step through the codes one at a time. When one does something, save it "
-            + "with a name. The fan's other buttons are usually nearby on the same address."));
-        pinStatus = text("");
-        pinStatus.setTextSize(20);
-        pinPanel.addView(pinStatus);
-        LinearLayout stepRow = new LinearLayout(this);
-        stepRow.setOrientation(LinearLayout.HORIZONTAL);
-        stepRow.addView(weighted(button("Previous", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                setAutoStep(false);
-                stepPin(-1);
-            }
-        })));
-        stepRow.addView(weighted(button("Send again", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                setAutoStep(false);
-                stepPin(0);
-            }
-        })));
-        stepRow.addView(weighted(button("Next", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                setAutoStep(false);
-                stepPin(1);
-            }
-        })));
-        pinPanel.addView(stepRow);
-        autoToggle = button("", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                setAutoStep(!autoStep);
-            }
-        });
-        pinPanel.addView(autoToggle);
-        setAutoStep(false);
-        pinPanel.addView(button("Save this code as a button", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                askLabel();
-            }
-        }));
-        LinearLayout addrRow = new LinearLayout(this);
-        addrRow.setOrientation(LinearLayout.HORIZONTAL);
-        addrRow.addView(weighted(button("Previous address", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                jumpAddress(-1);
-            }
-        })));
-        addrRow.addView(weighted(button("Next address", new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                jumpAddress(1);
-            }
-        })));
-        pinPanel.addView(addrRow);
-
-        remotePanel = column();
-        remoteButtons = column();
-        remotePanel.addView(remoteButtons);
+        buildScanPanel();
+        buildPinPanel();
+        buildRemotePanel();
 
         LinearLayout panels = column();
+        int pad = dp(20);
+        panels.setPadding(pad, pad, pad, pad);
         panels.addView(scanPanel);
         panels.addView(pinPanel);
         panels.addView(remotePanel);
         ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
         scroll.addView(panels);
-        root.addView(scroll);
+        root.addView(scroll, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        LinearLayout nav = new LinearLayout(this);
+        nav.setOrientation(LinearLayout.HORIZONTAL);
+        nav.setBackgroundColor(CARD);
+        nav.setPadding(dp(12), dp(8), dp(12), dp(8));
+        navFind = navItem("Find codes", () -> show(SCREEN_SCAN));
+        navRemote = navItem("Remote", () -> show(SCREEN_REMOTE));
+        nav.addView(navFind);
+        nav.addView(navRemote);
+        root.addView(nav, matchWidth(0));
+
         setContentView(root);
     }
 
-    /** Moves to the first command of the neighbouring address without sending anything. */
-    private void jumpAddress(int delta) {
-        setAutoStep(false);
-        int addressIndex = pinPos / Nec.COMMANDS + delta;
-        addressIndex = Math.max(0, Math.min(Nec.ADDRESSES - 1, addressIndex));
-        pinPos = addressIndex * Nec.COMMANDS;
-        refreshPin();
+    private void buildScanPanel() {
+        scanPanel = column();
+        scanPanel.addView(label("STEP 1 OF 2", 12, ACCENT, true));
+        scanPanel.addView(label("Find your fan's codes", 28, TEXT, true));
+        scanPanel.addView(label("The phone tries every code. Tell it the moment the fan reacts.", 15, MUTED, false));
+        scanPanel.addView(gap(20));
+
+        LinearLayout progress = card();
+        scanPercent = label("0.0%", 44, TEXT, true);
+        progress.addView(scanPercent);
+        scanLine = label("", 15, MUTED, false);
+        progress.addView(scanLine);
+        progress.addView(gap(14));
+        scanProgress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        scanProgress.setMax(TOTAL_CODES);
+        scanProgress.setProgressTintList(ColorStateList.valueOf(ACCENT));
+        scanProgress.setProgressBackgroundTintList(ColorStateList.valueOf(MUTED));
+        progress.addView(scanProgress, matchWidth(0));
+        progress.addView(gap(10));
+        scanCode = label("", 12, MUTED, false);
+        progress.addView(scanCode);
+        scanPanel.addView(progress);
+        scanPanel.addView(gap(16));
+
+        reactedButton = pill("It reacted!", AMBER, ON_AMBER, 120, 26, () -> onReacted());
+        scanPanel.addView(reactedButton);
+        scanPanel.addView(gap(12));
+        scanToggle = pill("Start scanning", ACCENT, ON_ACCENT, 60, 18, () -> {
+            if (scanning) {
+                scanning = false;
+            } else {
+                startScan();
+            }
+        });
+        scanPanel.addView(scanToggle);
+        scanPanel.addView(gap(20));
+
+        LinearLayout tips = card();
+        tips.addView(label("Before you start", 16, TEXT, true));
+        tips.addView(gap(8));
+        tips.addView(tip("1", "Switch the fan on at the wall."));
+        tips.addView(tip("2", "Point the top edge of the phone at the fan."));
+        tips.addView(tip("3", "Watch the fan and its light, and listen for a beep."));
+        scanPanel.addView(tips);
+        scanPanel.addView(gap(8));
+        scanPanel.addView(link("Start over from the first code", () -> new AlertDialog.Builder(this)
+            .setTitle("Start over?")
+            .setMessage("The scan will begin again from the first code. Saved buttons are kept.")
+            .setPositiveButton("Start over", (dialog, which) -> {
+                scanning = false;
+                scanPos = 0;
+                refreshScan();
+            })
+            .setNegativeButton("Cancel", null)
+            .show()));
     }
 
-    private void showPanel(View panel) {
-        if (panel != pinPanel) {
+    private void buildPinPanel() {
+        pinPanel = column();
+        pinPanel.addView(label("STEP 2 OF 2", 12, ACCENT, true));
+        pinPanel.addView(label("Find the exact button", 28, TEXT, true));
+        pinPanel.addView(label("Send one code at a time and watch the fan. Save each code that does something.",
+            15, MUTED, false));
+        pinPanel.addView(gap(20));
+
+        LinearLayout stepper = card();
+        pinStep = label("", 26, TEXT, true);
+        stepper.addView(pinStep);
+        pinCode = label("", 12, MUTED, false);
+        stepper.addView(pinCode);
+        stepper.addView(gap(16));
+        pinNext = pill("Next code", ACCENT, ON_ACCENT, 72, 20, () -> {
+            setAutoStep(false);
+            nextPin();
+        });
+        stepper.addView(pinNext);
+        stepper.addView(gap(10));
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.addView(pill("Back one", CARD_HIGH, TEXT, 56, 16, () -> {
+            setAutoStep(false);
+            stepPin(-1);
+        }), weighted(56, 0, 5));
+        row.addView(pill("Send again", CARD_HIGH, TEXT, 56, 16, () -> {
+            setAutoStep(false);
+            stepPin(0);
+        }), weighted(56, 5, 0));
+        stepper.addView(row, matchWidth(0));
+        stepper.addView(gap(10));
+        autoToggle = pill("", CARD_HIGH, TEXT, 56, 15, () -> setAutoStep(!autoStep));
+        stepper.addView(autoToggle);
+        pinPanel.addView(stepper);
+        pinPanel.addView(gap(16));
+        setAutoStep(false);
+
+        pinPanel.addView(pill("That one worked. Save it", AMBER, ON_AMBER, 72, 19, () -> askLabel()));
+        pinPanel.addView(gap(8));
+        pinPanel.addView(link("Nothing reacted. Keep scanning", () -> {
+            show(SCREEN_SCAN);
+            startScan();
+        }));
+        LinearLayout groups = new LinearLayout(this);
+        groups.setOrientation(LinearLayout.HORIZONTAL);
+        groups.addView(link("Previous group", () -> jumpGroup(-1)), weighted(48, 0, 0));
+        groups.addView(link("Next group", () -> jumpGroup(1)), weighted(48, 0, 0));
+        pinPanel.addView(groups, matchWidth(0));
+    }
+
+    private void buildRemotePanel() {
+        remotePanel = column();
+        remotePanel.addView(label("Fan remote", 28, TEXT, true));
+        remotePanel.addView(label("Point the top edge of the phone at the fan.", 15, MUTED, false));
+        remotePanel.addView(gap(16));
+        remoteGrid = column();
+        remotePanel.addView(remoteGrid);
+    }
+
+    private void show(int screen) {
+        if (screen != SCREEN_SCAN) {
+            scanning = false;
+        }
+        if (screen != SCREEN_PIN) {
             setAutoStep(false);
         }
-        scanPanel.setVisibility(panel == scanPanel ? View.VISIBLE : View.GONE);
-        pinPanel.setVisibility(panel == pinPanel ? View.VISIBLE : View.GONE);
-        remotePanel.setVisibility(panel == remotePanel ? View.VISIBLE : View.GONE);
+        scanPanel.setVisibility(screen == SCREEN_SCAN ? View.VISIBLE : View.GONE);
+        pinPanel.setVisibility(screen == SCREEN_PIN ? View.VISIBLE : View.GONE);
+        remotePanel.setVisibility(screen == SCREEN_REMOTE ? View.VISIBLE : View.GONE);
+        styleNav(navFind, screen != SCREEN_REMOTE);
+        styleNav(navRemote, screen == SCREEN_REMOTE);
     }
+
+    // ---------- view helpers ----------
 
     private LinearLayout column() {
         LinearLayout l = new LinearLayout(this);
@@ -554,36 +645,126 @@ public class MainActivity extends Activity {
         return l;
     }
 
-    private TextView text(String s) {
+    private LinearLayout card() {
+        LinearLayout l = column();
+        l.setBackground(rounded(CARD, 24));
+        int pad = dp(20);
+        l.setPadding(pad, pad, pad, pad);
+        return l;
+    }
+
+    private TextView label(String s, int sp, int color, boolean bold) {
         TextView t = new TextView(this);
         t.setText(s);
-        t.setTextSize(16);
-        int pad = dp(8);
-        t.setPadding(0, pad, 0, pad);
+        t.setTextSize(sp);
+        t.setTextColor(color);
+        if (bold) {
+            t.setTypeface(Typeface.DEFAULT_BOLD);
+        }
+        t.setPadding(0, dp(2), 0, dp(2));
         return t;
     }
 
-    private Button button(String label, View.OnClickListener onClick) {
-        Button b = new Button(this);
-        b.setText(label);
-        b.setAllCaps(false);
-        b.setMinHeight(dp(56));
-        b.setOnClickListener(onClick);
-        return b;
+    private View tip(String number, String text) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(6), 0, dp(6));
+        TextView badge = label(number, 14, ON_ACCENT, true);
+        badge.setGravity(Gravity.CENTER);
+        badge.setBackground(rounded(ACCENT, 14));
+        badge.setPadding(0, 0, 0, 0);
+        row.addView(badge, new LinearLayout.LayoutParams(dp(28), dp(28)));
+        TextView body = label(text, 15, TEXT, false);
+        body.setPadding(dp(12), 0, 0, 0);
+        row.addView(body, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        return row;
     }
 
-    private View tab(String label, final Runnable action) {
-        return weighted(button(label, new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                action.run();
-            }
-        }));
+    /** A filled, rounded button. */
+    private TextView pill(String text, int fill, int textColor, int heightDp, int sp, final Runnable action) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextSize(sp);
+        t.setTextColor(textColor);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setGravity(Gravity.CENTER);
+        t.setPadding(dp(12), 0, dp(12), 0);
+        t.setMinHeight(dp(heightDp));
+        t.setBackground(new RippleDrawable(ColorStateList.valueOf(0x40FFFFFF), rounded(fill, 20), null));
+        t.setClickable(true);
+        t.setFocusable(true);
+        if (action != null) {
+            t.setOnClickListener(v -> action.run());
+        }
+        return t;
     }
 
-    private View weighted(View v) {
-        v.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+    /** A plain text button for secondary actions. */
+    private TextView link(String text, final Runnable action) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextSize(15);
+        t.setTextColor(ACCENT);
+        t.setGravity(Gravity.CENTER);
+        t.setMinHeight(dp(48));
+        t.setBackground(new RippleDrawable(ColorStateList.valueOf(0x30FFFFFF), null, rounded(0xFFFFFFFF, 16)));
+        t.setClickable(true);
+        t.setFocusable(true);
+        t.setOnClickListener(v -> action.run());
+        return t;
+    }
+
+    private TextView navItem(String text, final Runnable action) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextSize(15);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setGravity(Gravity.CENTER);
+        t.setMinHeight(dp(48));
+        t.setClickable(true);
+        t.setFocusable(true);
+        t.setOnClickListener(v -> action.run());
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(48), 1f);
+        lp.setMargins(dp(4), 0, dp(4), 0);
+        t.setLayoutParams(lp);
+        return t;
+    }
+
+    private void styleNav(TextView item, boolean selected) {
+        item.setTextColor(selected ? ACCENT : MUTED);
+        item.setBackground(selected ? rounded(CARD_HIGH, 16) : null);
+    }
+
+    private void setEnabled(View v, boolean enabled) {
+        v.setEnabled(enabled);
+        v.setAlpha(enabled ? 1f : 0.35f);
+    }
+
+    private Drawable rounded(int color, int radiusDp) {
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(color);
+        d.setCornerRadius(dp(radiusDp));
+        return d;
+    }
+
+    private View gap(int heightDp) {
+        View v = new View(this);
+        v.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(heightDp)));
         return v;
+    }
+
+    private LinearLayout.LayoutParams matchWidth(int topDp) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, dp(topDp), 0, 0);
+        return lp;
+    }
+
+    private LinearLayout.LayoutParams weighted(int heightDp, int leftDp, int rightDp) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(heightDp), 1f);
+        lp.setMargins(dp(leftDp), 0, dp(rightDp), 0);
+        return lp;
     }
 
     private int dp(int value) {

@@ -1,7 +1,10 @@
 name: Build APK
 on:
   push:
+    branches: [main]
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -15,7 +18,13 @@ jobs:
         with:
           gradle-version: '8.9'
       - run: gradle :app:assembleDebug
-      - uses: actions/upload-artifact@v4
-        with:
-          name: fan-ir-scanner-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish the APK as the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk fan-ir-scanner.apk
+          gh release delete latest --cleanup-tag --yes || true
+          gh release create latest fan-ir-scanner.apk \
+            --title "Fan IR Scanner" \
+            --notes "Latest build from main. Download fan-ir-scanner.apk and open it on the phone." \
+            --target "$GITHUB_SHA"
